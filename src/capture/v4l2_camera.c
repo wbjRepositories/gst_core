@@ -240,7 +240,7 @@ void v4l2_get_format_mplane(int v4l2_fd, int plane_index,__u32 *stride, __u32 *s
  * @param out_buffers 输出：我们维护的管理结构体数组
  */
 void v4l2_init_dmabuf(int v4l2_fd, int req_count, int num_planes, 
-                        size_t *plane_sizes, struct dmabuf_buffer **out_buffers) {
+                        size_t *plane_sizes, struct dmabuf_buffer *out_buffers) {
     
     if (num_planes > MAX_V4L2_PLANES) {
         fprintf(stderr, "请求的平面数量超过宏定义最大值\n");
@@ -261,16 +261,16 @@ void v4l2_init_dmabuf(int v4l2_fd, int req_count, int num_planes,
     // *out_buffers = calloc(req.count, sizeof(struct dmabuf_buffer));
     
     for (unsigned int i = 0; i < req.count; ++i) {
-        (*out_buffers)[i].index = i;
-        (*out_buffers)[i].num_planes = num_planes;
+        out_buffers[i].index = i;
+        out_buffers[i].num_planes = num_planes;
 
         // 遍历分配每一个平面的内存
         for (int p = 0; p < num_planes; ++p) {
             int dma_fd = dmabuf_alloc(plane_sizes[p]);
             if (dma_fd < 0) exit(EXIT_FAILURE);
 
-            (*out_buffers)[i].planes[p].fd = dma_fd;
-            (*out_buffers)[i].planes[p].length = plane_sizes[p];
+            out_buffers[i].planes[p].fd = dma_fd;
+            out_buffers[i].planes[p].length = plane_sizes[p];
 
             // 零拷贝优化：如果后续100%只走 MPP/RKNN，这里可以直接注释掉 mmap
             // (*out_buffers)[i].planes[p].start = mmap(NULL, plane_sizes[p], 

@@ -3,6 +3,10 @@
 
 #include <linux/videodev2.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // 适配多平面格式，YUV420M 最多 3 个平面 (Y, U, V)
 #define MAX_V4L2_PLANES 3
 
@@ -25,14 +29,15 @@ int                     v4l2_open_device(const char *dev_name);
 void                    v4l2_print_formats_mplane(int v4l2_fd);
 void                    v4l2_set_format_mplane(int v4l2_fd, __u32 req_width, __u32 req_height, __u32 req_pixelformat, __u32 *out_sizes, __u8 *out_num_planes);
 void                    v4l2_get_format_mplane(int v4l2_fd, int plane_index,__u32 *stride, __u32 *sizeimage);
-void                    v4l2_init_dmabuf(int v4l2_fd, int req_count, int num_planes, size_t *plane_sizes, struct dmabuf_buffer **out_buffers);
+void                    v4l2_init_dmabuf(int v4l2_fd, int req_count, int num_planes, size_t *plane_sizes, struct dmabuf_buffer *out_buffers);
 void                    v4l2_queue_frame_dmabuf(int v4l2_fd, struct dmabuf_buffer *buf_info);
 struct dmabuf_buffer*   v4l2_dequeue_frame_dmabuf(int v4l2_fd, struct dmabuf_buffer *buffers);
 void                    v4l2_start_capturing(int v4l2_fd, unsigned int count, struct dmabuf_buffer *buf_info);
 void                    v4l2_stop_capturing(int v4l2_fd);
 void                    v4l2_close_device(int v4l2_fd);
 
-
-
+#ifdef __cplusplus
+}
+#endif
 
 #endif

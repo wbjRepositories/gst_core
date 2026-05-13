@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # 2. 项目名称和语言 (因为你有 .cpp 文件，所以包含 C 和 CXX)
-project(lubancat_gst_core LANGUAGES C)
+project(lubancat_gst_core LANGUAGES C CXX)
 
 # 3. 设置 C/C++ 标准
 set(CMAKE_C_STANDARD 11)
@@ -18,12 +18,16 @@ pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-video-1.0 gstreamer
 set(SOURCE_FILES
     src/capture/v4l2_camera.c
     src/core/dma_buffer.c
-    src/stream/gst_streamer.c
+    test/test.cpp
+    src/stream/vision_engine.cpp
     # 如果以后增加了新的模块，直接在这里添加 .c 或 .cpp 文件即可
 )
 
 # 6. 定义可执行文件目标
 add_executable(gst_app ${SOURCE_FILES})
+
+# 显式指定使用 C++ 链接器，确保链接 libstdc++
+set_target_properties(gst_app PROPERTIES LINKER_LANGUAGE CXX)
 
 # 7. 解决“找不到头文件”的问题：设置头文件搜索路径
 # 这里把所有子目录都加进去，你在代码里就可以直接 #include "dma_buffer.h"
