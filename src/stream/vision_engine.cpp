@@ -76,9 +76,6 @@ public:
             return false;
         }
         
-        
-        
-        
         unsigned int  out_sizes[1]   = {0};
         unsigned char out_num_planes = 0;
         v4l2_set_format_mplane(v4l2_fd, VIDEO_WIDTH, VIDEO_HEIGHT,
@@ -91,13 +88,20 @@ public:
         v4l2_init_dmabuf(v4l2_fd, num_buffers, 1, plane_sizes, out_buffers);
 
         /* ---- 创建 GStreamer 元件 ---- */
-        appsrc     = gst_element_factory_make("appsrc",     "v4l2out");
-        GstElement *capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
-        GstElement *mpph264enc = gst_element_factory_make("mpph264enc", "mpph264enc");
-        GstElement *rtph264pay = gst_element_factory_make("rtph264pay", "rtph264pay");
-        GstElement *udpsink    = gst_element_factory_make("udpsink",    "udpsink");
+        appsrc                  = gst_element_factory_make("appsrc",        "v4l2out");
+        GstElement *tee         = gst_element_factory_make("tee",           "tee");
+        
+        // 分支1：rga缩放给算法
+        GstElement *queue_rga   = gst_element_factory_make("queue",         "q_rga");
+        appsink     = gst_element_factory_make("appsink",       "appsink");
 
-        if (!appsrc || !capsfilter || !mpph264enc || !rtph264pay || !udpsink) {
+        // 分支2：远程传输
+        GstElement *queue_trans = gst_element_factory_make("queue",         "q_trans");
+        GstElement *mpph264enc  = gst_element_factory_make("mpph264enc",    "mpph264enc");
+        GstElement *rtph264pay  = gst_element_factory_make("rtph264pay",    "rtph264pay");
+        GstElement *udpsink     = gst_element_factory_make("udpsink",       "udpsink");
+
+        if (!appsrc || !tee || !queue_rga || !appsink || !queue_trans || !mpph264enc || !rtph264pay || !udpsink) {
             g_printerr("有元件创建失败，请检查插件是否安装！\n");
             return -1;
         }
@@ -109,7 +113,7 @@ public:
             "format",    G_TYPE_STRING, "NV12",
             "framerate", GST_TYPE_FRACTION, VIDEO_FPS, 1,
             NULL);
-        g_object_set(capsfilter, "caps", caps, NULL);
+        g_object_set(appsrc, "caps", caps, NULL);
         gst_caps_unref(caps);
 
         /* ========================================================================
@@ -141,13 +145,51 @@ public:
 
         /* ---- 组装 pipeline ---- */
         gst_bin_add_many(GST_BIN(pipeline),
-                        appsrc, capsfilter, mpph264enc, rtph264pay, udpsink, NULL);
+                        appsrc, tee, queue_rga, appsink, queue_trans, mpph264enc, rtph264pay, udpsink, NULL);
 
-        if (!gst_element_link_many(appsrc, capsfilter, mpph264enc,
+        if (!gst_element_link(appsrc, tee)) {
+            g_printerr("元件连接失败！可能是数据格式不兼容。\n");
+            return -1;
+        }
+                        
+        if (!gst_element_link_many(queue_rga, appsink, NULL)) {
+            g_printerr("元件连接失败！可能是数据格式不兼容。\n");
+            return -1;
+        }
+
+        if (!gst_element_link_many(queue_trans, mpph264enc,
                                     rtph264pay, udpsink, NULL)) {
             g_printerr("元件连接失败！可能是数据格式不兼容。\n");
             return -1;
         }
+
+        GstPad *pad_q_rga = gst_element_get_static_pad(queue_rga, "sink");
+        GstPad *pad_q_trans = gst_element_get_static_pad(queue_trans, "sink");
+
+        GstPad *tee_src0 = gst_element_request_pad_simple(tee, "src_%u");
+        GstPad *tee_src1 = gst_element_request_pad_simple(tee, "src_%u");
+
+        gst_pad_link(tee_src0, pad_q_rga);
+        gst_pad_link(tee_src1, pad_q_trans);
+
+        gst_object_unref(pad_q_rga);
+        gst_object_unref(pad_q_trans);
+        gst_object_unref(tee_src0);
+        gst_object_unref(tee_src1);
+
+
+        g_object_set(appsink, "emit-signals", TRUE, NULL);
+        g_object_set(appsink, "max-buffers", 1, "drop", TRUE, NULL);
+        g_signal_connect(appsink, "new-sample", G_CALLBACK(appsink_callback), NULL);
+
+
+
+
+
+
+
+
+
 
         GstBus *bus = gst_element_get_bus(pipeline);
         gst_bus_add_watch(bus, bus_callback_wrapper, this);
@@ -268,6 +310,48 @@ public:
         }
     }
 
+    /* 这是我们最关心的回调函数：每当有一帧新画面到来，这个函数就会被触发！ */
+    static GstFlowReturn appsink_callback(GstElement *sink, gpointer user_data) {
+        GstSample *sample;
+        GstBuffer *buffer;
+        GstMapInfo map;
+
+        // 1. 从 appsink 中拉取最新的 Sample (样本)
+        // 注意：一旦 emit 了信号，你必须把 sample 拔出来，否则管道会堵死！
+        g_signal_emit_by_name(sink, "pull-sample", &sample);
+        if (!sample) {
+            return GST_FLOW_ERROR; // 拉取失败
+        }
+
+        // 2. 从 Sample 中提取出 GstBuffer
+        // 注意：这里拿到的 buffer 属于 sample，不需要单独 unref 它
+        buffer = gst_sample_get_buffer(sample);
+        if (buffer) {
+            // 2. 获取 Buffer 中的第一个内存块 (通常 DMABuf 只有一个 memory block)
+            GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
+            
+            // 3. 检查该内存块是否真的是 DMABUF 类型
+            if (mem && gst_is_dmabuf_memory(mem)) {
+                
+                // 4. 提取文件描述符 FD
+                gint fd = gst_dmabuf_memory_get_fd(mem);
+                
+                g_print("成功提取 DMABUF FD: %d\n", fd);
+                
+                // TODO: 将 fd 传递给你的处理逻辑 (如 EGL, Vulkan, DRM 等)
+                // ...
+
+            } else {
+                g_print("警告: 当前 Buffer 不是 DMABUF 内存\n");
+            }
+        }
+
+        // 5. 释放 Sample 的引用计数 (极其重要！！！如果不写，一秒钟内存就能泄漏几十兆)
+        gst_sample_unref(sample);
+
+        // 返回 OK，告诉管道：这帧我处理完了，请继续给我下一帧
+        return GST_FLOW_OK;
+    }
 
     void appsrc_push_task() {
         struct pollfd poll_fd[1];
@@ -386,7 +470,7 @@ private:
 
         /* ---- 3. 添加 GstVideoMeta（告知编码器 NV12 的 stride 和 UV 偏移）---- */
         // NV12: Y 平面在前，UV 交错平面在后
-        gint   strides[4] = { stride, stride, 0, 0 };
+        gint   strides[4] = { static_cast<gint>(stride), static_cast<gint>(stride), 0, 0 };
         gsize  offsets[4] = { 0, (gsize)sizeimage * 2 / 3, 0, 0 };
 
         gst_buffer_add_video_meta_full(
