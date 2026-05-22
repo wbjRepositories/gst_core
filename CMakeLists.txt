@@ -20,6 +20,9 @@ set(SOURCE_FILES
     src/core/dma_buffer.c
     test/test.cpp
     src/stream/vision_engine.cpp
+    src/inference/inference.cpp
+    src/inference/postprocess.cc
+    src/process/gst_rga.c
     # 如果以后增加了新的模块，直接在这里添加 .c 或 .cpp 文件即可
 )
 
@@ -35,6 +38,9 @@ target_include_directories(gst_app PRIVATE
     src/capture
     src/core
     src/stream
+    src/inference
+    src/process
+    include/
     ${GSTREAMER_INCLUDE_DIRS}  # GStreamer 的头文件路径
 )
 
@@ -43,4 +49,6 @@ target_include_directories(gst_app PRIVATE
 target_link_libraries(gst_app PRIVATE
     ${GSTREAMER_LIBRARIES}
     pthread
+    rga
+    /home/cat/rknn_yolov5_demo/lib/librknnrt.so
 )

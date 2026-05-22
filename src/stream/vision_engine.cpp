@@ -15,14 +15,20 @@
 #include <gst/video/video.h>
 #include <gst/app/gstappsink.h>
 #include <poll.h>
+#include "gst_rga.h"
+#include "inference.h"
 
 #define VIDEO_WIDTH   3840
 #define VIDEO_HEIGHT  2160
 #define VIDEO_FPS     30
 
 
+struct dma_buff_fd_context {
+    GstSample* sample;
+    int fd;
+};
 
-
+using dma_ctx = dma_buff_fd_context;
 
 
 // 定义隐藏的实现类
@@ -57,7 +63,7 @@ public:
     std::mutex frame_mutex_;
     std::condition_variable frame_cv_;
     // 假设用一个简单的结构体保存图像地址，实际应用中这里传的是 DMA-BUF fd 或 mmap 的内存指针
-    std::queue<void*> frame_queue_; 
+    std::queue<dma_ctx> dma_fd_queue; 
 
     Impl() {
         gst_init(nullptr, nullptr);
@@ -93,7 +99,7 @@ public:
         
         // 分支1：rga缩放给算法
         GstElement *queue_rga   = gst_element_factory_make("queue",         "q_rga");
-        appsink     = gst_element_factory_make("appsink",       "appsink");
+        appsink                 = gst_element_factory_make("appsink",       "appsink");
 
         // 分支2：远程传输
         GstElement *queue_trans = gst_element_factory_make("queue",         "q_trans");
@@ -180,16 +186,7 @@ public:
 
         g_object_set(appsink, "emit-signals", TRUE, NULL);
         g_object_set(appsink, "max-buffers", 1, "drop", TRUE, NULL);
-        g_signal_connect(appsink, "new-sample", G_CALLBACK(appsink_callback), NULL);
-
-
-
-
-
-
-
-
-
+        g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample_static), this);
 
         GstBus *bus = gst_element_get_bus(pipeline);
         gst_bus_add_watch(bus, bus_callback_wrapper, this);
@@ -257,48 +254,106 @@ public:
     // 这是 appsink 的 C 风格回调，我们通过 user_data 把 C++ 的 this 指针传进来
     static GstFlowReturn on_new_sample_static(GstElement* sink, gpointer user_data) {
         auto* self = static_cast<Impl*>(user_data);
-        return self->on_new_sample();
+        return self->on_new_sample(sink);
     }
 
     // 真正的 C++ 处理逻辑：获取图像，丢入队列，唤醒推理线程
-    GstFlowReturn on_new_sample() {
-        GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
-        if (sample) {
-            // 解析 sample 获取 DMA-BUF fd 或指针 (此处省略细节)
-            void* frame_data = nullptr; // 伪代码
+    GstFlowReturn on_new_sample(GstElement* sink ) {
+        GstBuffer *buffer;
+        GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+        if (!sample) {
+            g_printerr("获取sample错误！\n");
+        }
+
+        buffer = gst_sample_get_buffer(sample);
+        if (!buffer) {
+            g_printerr("获取buffer错误！\n");
+        }
+
+        // 2. 获取 Buffer 中的第一个内存块 (通常 DMABuf 只有一个 memory block)
+        GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
+        
+        // 3. 检查该内存块是否真的是 DMABUF 类型
+        if (mem && gst_is_dmabuf_memory(mem)) {
+            
+            // 4. 提取文件描述符 FD
+            // gint fd = gst_dmabuf_memory_get_fd(mem);
+            gst_sample_ref(sample);
+            dma_ctx dctx;
+            dctx.fd = gst_dmabuf_memory_get_fd(mem);
+            dctx.sample = sample;
+            // g_print("成功提取 DMABUF FD: %d\n", fd);
             
             {
                 std::lock_guard<std::mutex> lock(frame_mutex_);
                 // 如果队列积压太多（推理太慢），丢弃旧帧保证实时性
-                if (frame_queue_.size() > 2) {
-                    frame_queue_.pop(); 
+                if (dma_fd_queue.size() > 2) {
+                    dma_fd_queue.pop(); 
                 }
-                frame_queue_.push(frame_data);
+                dma_fd_queue.push(dctx);
             }
             frame_cv_.notify_one(); // 唤醒推理线程
-            gst_sample_unref(sample);
+
+        } else {
+            g_print("警告: 当前 Buffer 不是 DMABUF 内存\n");
         }
+
+
+
+
+        // 解析 sample 获取 DMA-BUF fd 或指针 (此处省略细节)
+        // void* frame_data = nullptr; // 伪代码
+        // {
+        //     std::lock_guard<std::mutex> lock(frame_mutex_);
+        //     // 如果队列积压太多（推理太慢），丢弃旧帧保证实时性
+        //     if (frame_queue_.size() > 2) {
+        //         frame_queue_.pop(); 
+        //     }
+        //     frame_queue_.push(frame_data);
+        // }
+        // frame_cv_.notify_one(); // 唤醒推理线程
+
+        gst_sample_unref(sample);
+
         return GST_FLOW_OK;
     }
 
     // 独立的推理线程
     void inference_task() {
         // 在这里初始化 RKNN 模型
-        // init_rknn_model();
+        std::shared_ptr<rknn_model> model = std::make_shared<rknn_model>();
+        model->init();
 
         while (is_running) {
-            void* frame_data = nullptr;
+            dma_ctx dctx = {0};
             {
                 std::unique_lock<std::mutex> lock(frame_mutex_);
-                frame_cv_.wait(lock, [this]{ return !frame_queue_.empty() || !is_running; });
+                frame_cv_.wait(lock, [this]{ return !dma_fd_queue.empty() || !is_running; });
                 if (!is_running) break;
 
-                frame_data = frame_queue_.front();
-                frame_queue_.pop();
+                dctx = dma_fd_queue.front();
+                dma_fd_queue.pop();
             }
+
+            GstCaps *caps = gst_sample_get_caps(dctx.sample);
+            if (!caps) {
+                g_printerr("获取caps失败！\n");
+                return;
+            }
+            GstVideoInfo video_info;
+            if (!gst_video_info_from_caps(&video_info, caps)) {
+                g_printerr("Failed to parse caps into video info\n");
+                return;
+            }
+            
+            int dst_fd = model->get_dma_fd();
+
+            rga_scale_yolo(dctx.fd, dst_fd, video_info.width, video_info.height);
+
 
             // 1. 调用 RKNN 执行 YOLO 推理
             // std::vector<BoundingBox> results = run_rknn(frame_data);
+            model->run();
             
             // 测试用的伪数据
             std::vector<BoundingBox> results = {{10, 10, 50, 50, 0, 0.95}};
@@ -310,48 +365,6 @@ public:
         }
     }
 
-    /* 这是我们最关心的回调函数：每当有一帧新画面到来，这个函数就会被触发！ */
-    static GstFlowReturn appsink_callback(GstElement *sink, gpointer user_data) {
-        GstSample *sample;
-        GstBuffer *buffer;
-        GstMapInfo map;
-
-        // 1. 从 appsink 中拉取最新的 Sample (样本)
-        // 注意：一旦 emit 了信号，你必须把 sample 拔出来，否则管道会堵死！
-        g_signal_emit_by_name(sink, "pull-sample", &sample);
-        if (!sample) {
-            return GST_FLOW_ERROR; // 拉取失败
-        }
-
-        // 2. 从 Sample 中提取出 GstBuffer
-        // 注意：这里拿到的 buffer 属于 sample，不需要单独 unref 它
-        buffer = gst_sample_get_buffer(sample);
-        if (buffer) {
-            // 2. 获取 Buffer 中的第一个内存块 (通常 DMABuf 只有一个 memory block)
-            GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-            
-            // 3. 检查该内存块是否真的是 DMABUF 类型
-            if (mem && gst_is_dmabuf_memory(mem)) {
-                
-                // 4. 提取文件描述符 FD
-                gint fd = gst_dmabuf_memory_get_fd(mem);
-                
-                g_print("成功提取 DMABUF FD: %d\n", fd);
-                
-                // TODO: 将 fd 传递给你的处理逻辑 (如 EGL, Vulkan, DRM 等)
-                // ...
-
-            } else {
-                g_print("警告: 当前 Buffer 不是 DMABUF 内存\n");
-            }
-        }
-
-        // 5. 释放 Sample 的引用计数 (极其重要！！！如果不写，一秒钟内存就能泄漏几十兆)
-        gst_sample_unref(sample);
-
-        // 返回 OK，告诉管道：这帧我处理完了，请继续给我下一帧
-        return GST_FLOW_OK;
-    }
 
     void appsrc_push_task() {
         struct pollfd poll_fd[1];
