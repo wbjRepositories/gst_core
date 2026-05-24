@@ -6,11 +6,11 @@
 #include <string>
 
 // AI 推理结果的数据结构
-struct BoundingBox {
-    int x, y, width, height;
-    int class_id;
-    float confidence;
-};
+// struct BoundingBox {
+//     int x, y, width, height;
+//     int class_id;
+//     float confidence;
+// };
 
 class VisionEngine {
 public:
@@ -27,8 +27,8 @@ public:
     void stop();          // 停止推流和推理，释放资源
 
     // 2. 注册 AI 结果回调 (核心：把数据甩给外部)
-    using InferenceCallback = std::function<void(const std::vector<BoundingBox>&)>;
-    void set_inference_callback(InferenceCallback callback);
+    // using InferenceCallback = std::function<void(const std::vector<BoundingBox>&)>;
+    // void set_inference_callback(InferenceCallback callback);
 
     // 3. WebRTC 信令交互接口 (供外部信令服务器调用)
     void set_remote_description(const std::string& type, const std::string& sdp);

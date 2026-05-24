@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <queue>
+#include <vector>
 #include "v4l2_camera.h"
 #include <gst/app/gstappsrc.h>
 #include <gst/video/video.h>
@@ -17,10 +18,20 @@
 #include <poll.h>
 #include "gst_rga.h"
 #include "inference.h"
+#include <rga/im2d.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/dma-buf.h>
 
 #define VIDEO_WIDTH   3840
 #define VIDEO_HEIGHT  2160
 #define VIDEO_FPS     30
+
+
+
+
+extern std::queue<BoundingBox> g_bb_q;
+extern std::mutex g_queue_mutex;
 
 
 struct dma_buff_fd_context {
@@ -29,6 +40,11 @@ struct dma_buff_fd_context {
 };
 
 using dma_ctx = dma_buff_fd_context;
+
+struct GstBufferReleaseContext {
+    int v4l2_fd;
+    dmabuf_buffer *v4l2_buf;
+};
 
 
 // 定义隐藏的实现类
@@ -57,7 +73,7 @@ public:
     std::atomic<bool> is_running{false};
 
     // 外部注册的回调
-    VisionEngine::InferenceCallback inference_cb_;
+    // VisionEngine::InferenceCallback inference_cb_;
 
     // appsink 到 inference 线程的图像队列和锁
     std::mutex frame_mutex_;
@@ -136,7 +152,7 @@ public:
             NULL);
 
         g_object_set(rtph264pay, "config-interval", 1, NULL);
-        g_object_set(udpsink, "host", "192.168.1.5", "port", 5000, NULL);
+        g_object_set(udpsink, "host", "192.168.1.10", "port", 5000, NULL);
 
         /* ---- Pipeline ---- */
         pipeline = gst_pipeline_new("my_player_pipeline");
@@ -168,6 +184,18 @@ public:
             g_printerr("元件连接失败！可能是数据格式不兼容。\n");
             return -1;
         }
+
+        
+        GstPad *mpph264enc_sink_pad = gst_element_get_static_pad(mpph264enc, "sink");
+
+        gst_pad_add_probe(
+        mpph264enc_sink_pad, 
+        GST_PAD_PROBE_TYPE_BUFFER, 
+        (GstPadProbeCallback)osd_probe_callback, 
+        NULL, // 传给回调的用户数据
+        NULL  // 销毁回调时的清理函数
+    );
+
 
         GstPad *pad_q_rga = gst_element_get_static_pad(queue_rga, "sink");
         GstPad *pad_q_trans = gst_element_get_static_pad(queue_trans, "sink");
@@ -248,6 +276,317 @@ public:
         }
         // ... 清理其他对象
     }
+// 裁剪
+static int clamp(int v, int low, int high)
+{
+    if (v < low) return low;
+    if (v > high) return high;
+    return v;
+}
+
+static int align_up(int value, int align)
+{
+    return (value + align - 1) & ~(align - 1);
+}
+
+static void clip_box(int &x1, int &y1, int &x2, int &y2, int width, int height)
+{
+    x1 = clamp(x1, 0, width - 1);
+    y1 = clamp(y1, 0, height - 1);
+    x2 = clamp(x2, 0, width - 1);
+    y2 = clamp(y2, 0, height - 1);
+}
+
+static void release_v4l2_buffer_when_gst_done(gpointer data)
+{
+    auto *ctx = static_cast<GstBufferReleaseContext *>(data);
+    if (ctx && ctx->v4l2_buf) {
+        v4l2_queue_frame_dmabuf(ctx->v4l2_fd, ctx->v4l2_buf);
+    }
+    delete ctx;
+}
+
+static int draw_rect_rga(
+    rga_buffer_t &img,
+    int x1, int y1,
+    int x2, int y2,
+    int thickness,
+    int color)
+{
+    if (x2 <= x1 || y2 <= y1) {
+        g_print("invalid box: %d %d %d %d\n", x1, y1, x2, y2);
+        return -1;
+    }
+
+    int w = x2 - x1;
+    int h = y2 - y1;
+    thickness = clamp(thickness, 1, (w < h ? w : h));
+
+    im_rect rect = {x1, y1, w, h};
+    IM_STATUS ret = imrectangle(img, rect, color, thickness);
+    if (ret == IM_STATUS_SUCCESS) {
+        return 0;
+    }
+    g_print("imrectangle failed: %s, fallback to imfill\n", imStrError(ret));
+
+    im_rect top    = {x1, y1, w, thickness};
+    im_rect bottom = {x1, y2 - thickness, w, thickness};
+    im_rect left   = {x1, y1, thickness, h};
+    im_rect right  = {x2 - thickness, y1, thickness, h};
+
+    ret = imfill(img, top, color);
+    if (ret != IM_STATUS_SUCCESS) {
+        g_print("top imfill failed: %s\n", imStrError(ret));
+        return -1;
+    }
+
+    ret = imfill(img, bottom, color);
+    if (ret != IM_STATUS_SUCCESS) {
+        g_print("bottom imfill failed: %s\n", imStrError(ret));
+        return -1;
+    }
+
+    ret = imfill(img, left, color);
+    if (ret != IM_STATUS_SUCCESS) {
+        g_print("left imfill failed: %s\n", imStrError(ret));
+        return -1;
+    }
+
+    ret = imfill(img, right, color);
+    if (ret != IM_STATUS_SUCCESS) {
+        g_print("right imfill failed: %s\n", imStrError(ret));
+        return -1;
+    }
+
+    return 0;
+}
+
+static void fill_nv12_rect(
+    guint8 *data,
+    gsize size,
+    int x,
+    int y,
+    int rect_w,
+    int rect_h,
+    int width,
+    int height,
+    int y_stride,
+    int uv_stride,
+    gsize uv_offset,
+    guint8 y_value,
+    guint8 u_value,
+    guint8 v_value)
+{
+    if (!data || rect_w <= 0 || rect_h <= 0) {
+        return;
+    }
+
+    int x1 = clamp(x, 0, width);
+    int y1 = clamp(y, 0, height);
+    int x2 = clamp(x + rect_w, 0, width);
+    int y2 = clamp(y + rect_h, 0, height);
+    if (x2 <= x1 || y2 <= y1) {
+        return;
+    }
+
+    for (int row = y1; row < y2; ++row) {
+        gsize offset = (gsize)row * y_stride + x1;
+        if (offset + (x2 - x1) <= size) {
+            memset(data + offset, y_value, x2 - x1);
+        }
+    }
+
+    int uv_x1 = x1 & ~1;
+    int uv_x2 = (x2 + 1) & ~1;
+    int uv_y1 = y1 & ~1;
+    int uv_y2 = (y2 + 1) & ~1;
+    for (int row = uv_y1 / 2; row < uv_y2 / 2; ++row) {
+        for (int col = uv_x1; col < uv_x2; col += 2) {
+            gsize offset = uv_offset + (gsize)row * uv_stride + col;
+            if (offset + 1 < size) {
+                data[offset] = u_value;
+                data[offset + 1] = v_value;
+            }
+        }
+    }
+}
+
+static int draw_rect_nv12(
+    int fd,
+    gsize mem_offset,
+    gsize buffer_size,
+    gsize map_size,
+    int x1, int y1,
+    int x2, int y2,
+    int thickness,
+    int width,
+    int height,
+    int y_stride,
+    int uv_stride,
+    gsize uv_offset)
+{
+    if (x2 <= x1 || y2 <= y1) {
+        g_print("invalid box: %d %d %d %d\n", x1, y1, x2, y2);
+        return -1;
+    }
+
+    int w = x2 - x1;
+    int h = y2 - y1;
+    thickness = clamp(thickness, 1, (w < h ? w : h));
+
+    void *mapped = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        g_printerr("NV12 dmabuf mmap failed\n");
+        return -1;
+    }
+
+    struct dma_buf_sync sync_start = {0};
+    sync_start.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+
+    const guint8 red_y = 76;
+    const guint8 red_u = 84;
+    const guint8 red_v = 255;
+
+    guint8 *data = static_cast<guint8 *>(mapped) + mem_offset;
+    fill_nv12_rect(data, buffer_size, x1, y1, w, thickness,
+                   width, height, y_stride, uv_stride, uv_offset,
+                   red_y, red_u, red_v);
+    fill_nv12_rect(data, buffer_size, x1, y2 - thickness, w, thickness,
+                   width, height, y_stride, uv_stride, uv_offset,
+                   red_y, red_u, red_v);
+    fill_nv12_rect(data, buffer_size, x1, y1, thickness, h,
+                   width, height, y_stride, uv_stride, uv_offset,
+                   red_y, red_u, red_v);
+    fill_nv12_rect(data, buffer_size, x2 - thickness, y1, thickness, h,
+                   width, height, y_stride, uv_stride, uv_offset,
+                   red_y, red_u, red_v);
+
+    struct dma_buf_sync sync_end = {0};
+    sync_end.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+    munmap(mapped, map_size);
+    return 0;
+}
+
+    /* 【核心】：探针回调函数 */
+static GstPadProbeReturn osd_probe_callback(
+    GstPad *pad,
+    GstPadProbeInfo *info,
+    gpointer user_data)
+{
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
+
+    // g_print("memory count = %u\n", gst_buffer_n_memory(buffer));
+    // g_print("is dmabuf = %d\n", gst_is_dmabuf_memory(mem));
+
+    if (!mem || !gst_is_dmabuf_memory(mem)) {
+        g_printerr("不是 DMABUF memory\n");
+        return GST_PAD_PROBE_OK;
+    }
+
+    int fd = gst_dmabuf_memory_get_fd(mem);
+    gsize mem_offset = 0;
+    gsize max_size = 0;
+    gsize mem_size = gst_memory_get_sizes(mem, &mem_offset, &max_size);
+    gsize map_size = max_size > 0 ? max_size : mem_size;
+
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (!caps) {
+        g_printerr("无法获取 caps\n");
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+
+    int width = 0;
+    int height = 0;
+    const char *format = gst_structure_get_string(s, "format");
+
+    if (!gst_structure_get_int(s, "width", &width) ||
+        !gst_structure_get_int(s, "height", &height) ||
+        !format) {
+        g_printerr("caps 中没有 width/height/format\n");
+        gst_caps_unref(caps);
+        return GST_PAD_PROBE_OK;
+    }
+
+    int rga_format = 0;
+    bool is_nv12 = false;
+
+    if (g_strcmp0(format, "NV12") == 0) {
+        rga_format = RK_FORMAT_YCbCr_420_SP;
+        is_nv12 = true;
+    } else if (g_strcmp0(format, "RGB") == 0) {
+        rga_format = RK_FORMAT_RGB_888;
+    } else if (g_strcmp0(format, "BGR") == 0) {
+        rga_format = RK_FORMAT_BGR_888;
+    } else if (g_strcmp0(format, "RGBA") == 0) {
+        rga_format = RK_FORMAT_RGBA_8888;
+    } else {
+        g_printerr("RGA 暂不支持当前 format: %s\n", format);
+        gst_caps_unref(caps);
+        return GST_PAD_PROBE_OK;
+    }
+
+    gst_caps_unref(caps);
+
+    int wstride = width;
+    int hstride = height;
+    int uv_stride = width;
+    gsize uv_offset = (gsize)width * height;
+    GstVideoMeta *vmeta = gst_buffer_get_video_meta(buffer);
+    if (vmeta && vmeta->n_planes > 0) {
+        wstride = vmeta->stride[0];
+        if (is_nv12 && vmeta->n_planes > 1 && vmeta->stride[0] > 0) {
+            uv_stride = vmeta->stride[1];
+            uv_offset = vmeta->offset[1];
+            hstride = vmeta->offset[1] / vmeta->stride[0];
+        }
+    } else if (is_nv12) {
+        wstride = align_up(width, 16);
+        hstride = align_up(height, 2);
+        uv_stride = wstride;
+        uv_offset = (gsize)wstride * hstride;
+    }
+
+    std::vector<BoundingBox> boxes;
+    {
+        std::lock_guard<std::mutex> lock(g_queue_mutex);
+        while (!g_bb_q.empty()) {
+            boxes.push_back(g_bb_q.front());
+            g_bb_q.pop();
+        }
+    }
+
+    for (auto &bb : boxes) {
+        printf("front：x1=%d,y1=%d\nx2=%d,y2=%d\n",bb.x1,bb.y1,bb.x2,bb.y2);
+        clip_box(bb.x1, bb.y1, bb.x2, bb.y2, width, height);
+        if (is_nv12) {
+            draw_rect_nv12(fd, mem_offset, mem_size, map_size,
+                           bb.x1, bb.y1, bb.x2, bb.y2, 8,
+                           width, height, wstride, uv_stride, uv_offset);
+        } else {
+            rga_buffer_t img = wrapbuffer_fd(
+                fd,
+                width,
+                height,
+                rga_format,
+                wstride,
+                hstride
+            );
+            draw_rect_rga(img, bb.x1, bb.y1, bb.x2, bb.y2, 8, 0xEB8080);
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
 
     // ------------------- 核心机制 -------------------
 
@@ -348,20 +687,25 @@ public:
             
             int dst_fd = model->get_dma_fd();
 
-            rga_scale_yolo(dctx.fd, dst_fd, video_info.width, video_info.height);
+            if (rga_scale_yolo(dctx.fd, dst_fd, video_info.width, video_info.height) != 0) {
+                g_printerr("RGA preprocess failed, skip this frame\n");
+                gst_sample_unref(dctx.sample);
+                continue;
+            }
 
 
             // 1. 调用 RKNN 执行 YOLO 推理
             // std::vector<BoundingBox> results = run_rknn(frame_data);
             model->run();
+            gst_sample_unref(dctx.sample);
             
             // 测试用的伪数据
             std::vector<BoundingBox> results = {{10, 10, 50, 50, 0, 0.95}};
 
             // 2. 如果外部注册了回调，把结果甩出去 (甩给 ROS 2)
-            if (inference_cb_) {
-                inference_cb_(results);
-            }
+            // if (inference_cb_) {
+            //     inference_cb_(results);
+            // }
         }
     }
 
@@ -385,9 +729,6 @@ public:
 
                 if (buf) {
                     GstFlowReturn ret = push_one_frame(buf);
-
-                    /* 归还 buffer 给 V4L2 驱动（QBUF），以便下次填充 */
-                    v4l2_queue_frame_dmabuf(v4l2_fd, buf);
 
                     if (ret == GST_FLOW_FLUSHING || ret == GST_FLOW_ERROR) {
                         g_print("管道已停止，结束推流。\n");
@@ -466,6 +807,7 @@ private:
         int fd_dup = dup(v4l2_buf->planes[0].fd);
         if (fd_dup < 0) {
             g_printerr("dup DMA-BUF fd 失败！\n");
+            v4l2_queue_frame_dmabuf(v4l2_fd, v4l2_buf);
             return GST_FLOW_ERROR;
         }
 
@@ -475,11 +817,20 @@ private:
         if (!mem) {
             g_printerr("从 dmabuf fd 创建 GstMemory 失败！\n");
             close(fd_dup);
+            v4l2_queue_frame_dmabuf(v4l2_fd, v4l2_buf);
             return GST_FLOW_ERROR;
         }
 
         GstBuffer *buffer = gst_buffer_new();
         gst_buffer_append_memory(buffer, mem);
+
+        auto *release_ctx = new GstBufferReleaseContext{v4l2_fd, v4l2_buf};
+        static GQuark release_quark = g_quark_from_static_string("gst-core-v4l2-buffer-release");
+        gst_mini_object_set_qdata(
+            GST_MINI_OBJECT(buffer),
+            release_quark,
+            release_ctx,
+            release_v4l2_buffer_when_gst_done);
 
         /* ---- 3. 添加 GstVideoMeta（告知编码器 NV12 的 stride 和 UV 偏移）---- */
         // NV12: Y 平面在前，UV 交错平面在后
@@ -531,9 +882,9 @@ bool VisionEngine::init() { return pimpl_->init(); }
 bool VisionEngine::start() { pimpl_->start(); return true; }
 void VisionEngine::stop() { pimpl_->stop(); }
 
-void VisionEngine::set_inference_callback(InferenceCallback cb) {
-    pimpl_->inference_cb_ = std::move(cb);
-}
+// void VisionEngine::set_inference_callback(InferenceCallback cb) {
+//     pimpl_->inference_cb_ = std::move(cb);
+// }
 
 void VisionEngine::set_remote_description(const std::string& type, const std::string& sdp) {
     // 调用底层的 webrtcbin 相关逻辑...

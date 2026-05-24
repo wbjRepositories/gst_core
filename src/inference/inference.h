@@ -6,10 +6,19 @@
 #include "rknn_api.h"
 #include "postprocess.h"
 
+
+struct BoundingBox {
+    int x1, y1, x2, y2;
+    int class_id;
+    float confidence;
+};
+
+
 class rknn_model {
 private:
     rknn_context ctx = 0;
     rknn_tensor_mem *input_mem = nullptr;
+    rknn_tensor_attr input_attr{};
     rknn_input_output_num io_num;
     std::vector<rknn_tensor_attr> output_attrs;
     std::vector<rknn_tensor_mem *> output_mem;

@@ -56,17 +56,19 @@ IM_STATUS status = improcess(
     src_rect,
     dst_rect,
     pat_rect,
-    0
+    IM_SYNC
 );
         
         if (status == IM_STATUS_SUCCESS) {
-            printf("RGA 转换并缩放成功！\n");
+            // printf("RGA 转换并缩放成功！\n");
         } else {
             printf("RGA 失败，错误码：%d, 错误信息：%s\n", status, imStrError((IM_STATUS)status));
+            return -1;
         }
     } else {
         printf("RGA 硬件不支持当前的输入输出参数组合！\n");
         printf("imcheck failed: %d, %s\n", check_ret, imStrError(check_ret));
+        return -1;
     }
 
     return 0;
